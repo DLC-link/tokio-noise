@@ -479,6 +479,21 @@ impl AsyncRead for NoiseTcpStream {
         cx: &mut Context<'_>,
         output_buf: &mut io::ReadBuf<'_>,
     ) -> Poll<Result<(), io::Error>> {
+        // Opportunistically flush any ciphertext left over from a previous
+        // partial write. A request/response caller that has finished writing
+        // and now only awaits a read would otherwise never drive
+        // `write_overflow_buf` out (`poll_write`/`poll_flush` are the only
+        // other drain points), so the peer never receives the full request and
+        // never replies — a deadlock. After a partial write `tcp.poll_write`
+        // returned `Ready`, so no write-readiness waker is even registered;
+        // draining here both makes progress and re-arms that waker on `Pending`.
+        // We deliberately ignore the drain's backpressure: a full send buffer
+        // must not block reads. A hard write error means the connection is
+        // broken, so surface it.
+        if let Poll::Ready(Err(e)) = self.poll_drain_write_overflow(cx) {
+            return Poll::Ready(Err(e));
+        }
+
         let mut total_read = 0;
         loop {
             if output_buf.remaining() == 0 {
