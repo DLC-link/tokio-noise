@@ -506,6 +506,9 @@ impl AsyncRead for NoiseTcpStream {
                 // the caller's buffer, so leaving them queued serves them a
                 // second time on the next poll.
                 drop_front_items(&mut self.read_overflow_buf, n_overflow_to_write);
+                // These bytes are in the caller's buffer, so they count as read. A
+                // `Pending` return below would make the caller discard them.
+                total_read += n_overflow_to_write;
 
                 if output_buf.remaining() == 0 {
                     return Poll::Ready(Ok(()));
@@ -895,6 +898,69 @@ mod tests {
         };
 
         run_client_server_test(server_run, client_run).await;
+    }
+
+    /// An HTTP body must arrive in full at every size.
+    ///
+    /// Bytes served from `read_overflow_buf` are already in the caller's
+    /// buffer, so they count as read. If `poll_read` then returned `Pending`
+    /// because the socket was empty, the caller dropped those bytes and waited
+    /// for them forever. Whether it happened depended on the exact length, so
+    /// the sizes below include lengths that failed every time.
+    #[tokio::test]
+    async fn http1_post_large_bodies_arrive_in_full() {
+        const SIZES: [usize; 5] = [20_000, 24_896, 25_000, 25_135, 32_000];
+
+        fn payload(size: usize) -> Vec<u8> {
+            (0..size).map(|i| (i % 251) as u8).collect()
+        }
+
+        for size in SIZES {
+            let server_run = move |noise_stream: NoiseTcpStream| async move {
+                let service_fn = move |req: Request<hyper::body::Incoming>| async move {
+                    let got = req
+                        .collect()
+                        .await
+                        .expect("server error reading request body")
+                        .to_bytes();
+                    assert!(got == payload(size), "body of {size} bytes arrived changed");
+                    Ok::<_, hyper::Error>(Response::new(String::new()))
+                };
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(noise_stream),
+                        hyper::service::service_fn(service_fn),
+                    )
+                    .await
+                    .expect("error serving HTTP1 POST request");
+            };
+
+            let client_run = move |noise_stream: NoiseTcpStream| async move {
+                let (mut sender, conn) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(noise_stream))
+                        .await
+                        .expect("client failed to run HTTP1 handshake");
+                let driver = spawn(async move {
+                    conn.await.expect("client connection driver failed");
+                });
+                let req = Request::builder()
+                    .method("POST")
+                    .body(http_body_util::Full::new(bytes::Bytes::from(payload(size))))
+                    .unwrap();
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    sender.send_request(req),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("body of {size} bytes stalled"))
+                .expect("client failed to send HTTP1 POST request");
+                assert_eq!(res.status(), 200);
+                drop(sender);
+                driver.await.unwrap();
+            };
+
+            run_client_server_test(server_run, client_run).await;
+        }
     }
 
     #[tokio::test]
