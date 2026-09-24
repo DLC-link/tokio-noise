@@ -513,6 +513,7 @@ impl AsyncRead for NoiseTcpStream {
                 );
 
                 drop_front_items(&mut self.read_overflow_buf, n_overflow_to_write);
+                total_read += n_overflow_to_write;
             }
 
             let mut ciphertext = [0u8; CIPHERTEXT_PACKET_SIZE];
