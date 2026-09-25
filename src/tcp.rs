@@ -506,6 +506,7 @@ impl AsyncRead for NoiseTcpStream {
                 // the caller's buffer, so leaving them queued serves them a
                 // second time on the next poll.
                 drop_front_items(&mut self.read_overflow_buf, n_overflow_to_write);
+                total_read += n_overflow_to_write;
 
                 if output_buf.remaining() == 0 {
                     return Poll::Ready(Ok(()));
