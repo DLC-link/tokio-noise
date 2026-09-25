@@ -842,6 +842,39 @@ mod tests {
         run_client_server_test(server_run, client_run).await;
     }
 
+    /// The second read gets its bytes from `read_overflow_buf`, and the socket
+    /// has no new data. `poll_read` must return those bytes, not `Pending`.
+    /// Without the fix, the reader waits until the timeout.
+    #[tokio::test]
+    async fn recv_returns_buffered_bytes_while_socket_waits_for_more() {
+        let server_run = |mut noise_stream: NoiseTcpStream| async move {
+            let mut first = [0; 3];
+            assert_eq!(noise_stream.recv(&mut first).await.unwrap(), first.len());
+            assert_eq!(&first, b"abc");
+
+            let mut rest = [0; 16];
+            let read = noise_stream.recv(&mut rest).await.unwrap();
+            assert_eq!(read, 5);
+            assert_eq!(&rest[..read], b"defgh");
+
+            noise_stream.send(b"OK").await.unwrap();
+        };
+
+        let client_run = |mut noise_stream: NoiseTcpStream| async move {
+            noise_stream.send(b"abcdefgh").await.unwrap();
+            let mut reply = [0; 2];
+            assert_eq!(noise_stream.recv(&mut reply).await.unwrap(), reply.len());
+            assert_eq!(&reply, b"OK");
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_client_server_test(server_run, client_run),
+        )
+        .await
+        .expect("buffered bytes did not wake the reader");
+    }
+
     #[tokio::test]
     async fn http1_get() {
         let server_run = |noise_stream: NoiseTcpStream| async move {
