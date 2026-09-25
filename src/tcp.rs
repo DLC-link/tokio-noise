@@ -506,6 +506,7 @@ impl AsyncRead for NoiseTcpStream {
                 // the caller's buffer, so leaving them queued serves them a
                 // second time on the next poll.
                 drop_front_items(&mut self.read_overflow_buf, n_overflow_to_write);
+                total_read += n_overflow_to_write;
 
                 if output_buf.remaining() == 0 {
                     return Poll::Ready(Ok(()));
@@ -841,6 +842,39 @@ mod tests {
         run_client_server_test(server_run, client_run).await;
     }
 
+    /// The second read gets its bytes from `read_overflow_buf`, and the socket
+    /// has no new data. `poll_read` must return those bytes, not `Pending`.
+    /// Without the fix, the reader waits until the timeout.
+    #[tokio::test]
+    async fn recv_returns_buffered_bytes_while_socket_waits_for_more() {
+        let server_run = |mut noise_stream: NoiseTcpStream| async move {
+            let mut first = [0; 3];
+            assert_eq!(noise_stream.recv(&mut first).await.unwrap(), first.len());
+            assert_eq!(&first, b"abc");
+
+            let mut rest = [0; 16];
+            let read = noise_stream.recv(&mut rest).await.unwrap();
+            assert_eq!(read, 5);
+            assert_eq!(&rest[..read], b"defgh");
+
+            noise_stream.send(b"OK").await.unwrap();
+        };
+
+        let client_run = |mut noise_stream: NoiseTcpStream| async move {
+            noise_stream.send(b"abcdefgh").await.unwrap();
+            let mut reply = [0; 2];
+            assert_eq!(noise_stream.recv(&mut reply).await.unwrap(), reply.len());
+            assert_eq!(&reply, b"OK");
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_client_server_test(server_run, client_run),
+        )
+        .await
+        .expect("buffered bytes did not wake the reader");
+    }
+
     #[tokio::test]
     async fn http1_get() {
         let server_run = |noise_stream: NoiseTcpStream| async move {
@@ -1064,6 +1098,70 @@ mod tests {
             let mut vec: Vec<usize> = vec![];
             drop_front_items(&mut vec, 0);
             assert_eq!(vec, vec![]);
+        }
+    }
+
+    /// An HTTP POST body arrives in full at a wide sample of sizes.
+    ///
+    /// Whether a body lost bytes depended on its exact length, so this sends
+    /// every 37th length up to 70 KB, and the lengths that failed on devnet.
+    /// Each size runs one whole connection: the handshake, the request, the
+    /// body read and the shutdown. A stall in any of them fails the test after
+    /// 5s and names the size.
+    #[tokio::test]
+    async fn http1_post_bodies_of_sampled_sizes_arrive_in_full() {
+        fn payload(size: usize) -> Vec<u8> {
+            (0..size).map(|i| (i % 251) as u8).collect()
+        }
+
+        let sizes = (1..=70_000).step_by(37).chain([24_896, 25_000, 25_135]);
+        for size in sizes {
+            let server_run = move |noise_stream: NoiseTcpStream| async move {
+                let service_fn = move |req: Request<hyper::body::Incoming>| async move {
+                    let got = req
+                        .collect()
+                        .await
+                        .expect("server error reading request body")
+                        .to_bytes();
+                    assert!(got == payload(size), "body of {size} bytes arrived changed");
+                    Ok::<_, hyper::Error>(Response::new(String::new()))
+                };
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(noise_stream),
+                        hyper::service::service_fn(service_fn),
+                    )
+                    .await
+                    .expect("error serving HTTP1 POST request");
+            };
+
+            let client_run = move |noise_stream: NoiseTcpStream| async move {
+                let (mut sender, conn) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(noise_stream))
+                        .await
+                        .expect("client failed to run HTTP1 handshake");
+                let driver = spawn(async move {
+                    conn.await.expect("client connection driver failed");
+                });
+                let req = Request::builder()
+                    .method("POST")
+                    .body(http_body_util::Full::new(bytes::Bytes::from(payload(size))))
+                    .unwrap();
+                let res = sender
+                    .send_request(req)
+                    .await
+                    .expect("client failed to send HTTP1 POST request");
+                assert_eq!(res.status(), 200);
+                drop(sender);
+                driver.await.unwrap();
+            };
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                run_client_server_test(server_run, client_run),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("body of {size} bytes stalled"));
         }
     }
 }
