@@ -1100,4 +1100,63 @@ mod tests {
             assert_eq!(vec, vec![]);
         }
     }
+
+    /// Checks sampled HTTP body sizes, including the lengths that failed on devnet.
+    /// Each size gets a full connection and a timeout that reports stalls.
+    #[tokio::test]
+    async fn http1_post_bodies_of_sampled_sizes_arrive_in_full() {
+        fn payload(size: usize) -> Vec<u8> {
+            (0..size).map(|i| (i % 251) as u8).collect()
+        }
+
+        let sizes = (1..=70_000).step_by(37).chain([24_896, 25_000, 25_135]);
+        for size in sizes {
+            let server_run = move |noise_stream: NoiseTcpStream| async move {
+                let service_fn = move |req: Request<hyper::body::Incoming>| async move {
+                    let got = req
+                        .collect()
+                        .await
+                        .expect("server error reading request body")
+                        .to_bytes();
+                    assert!(got == payload(size), "body of {size} bytes arrived changed");
+                    Ok::<_, hyper::Error>(Response::new(String::new()))
+                };
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(noise_stream),
+                        hyper::service::service_fn(service_fn),
+                    )
+                    .await
+                    .expect("error serving HTTP1 POST request");
+            };
+
+            let client_run = move |noise_stream: NoiseTcpStream| async move {
+                let (mut sender, conn) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(noise_stream))
+                        .await
+                        .expect("client failed to run HTTP1 handshake");
+                let driver = spawn(async move {
+                    conn.await.expect("client connection driver failed");
+                });
+                let req = Request::builder()
+                    .method("POST")
+                    .body(http_body_util::Full::new(bytes::Bytes::from(payload(size))))
+                    .unwrap();
+                let res = sender
+                    .send_request(req)
+                    .await
+                    .expect("client failed to send HTTP1 POST request");
+                assert_eq!(res.status(), 200);
+                drop(sender);
+                driver.await.unwrap();
+            };
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                run_client_server_test(server_run, client_run),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("body of {size} bytes stalled"));
+        }
+    }
 }
