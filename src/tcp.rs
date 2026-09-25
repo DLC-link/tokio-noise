@@ -1101,8 +1101,13 @@ mod tests {
         }
     }
 
-    /// Checks sampled HTTP body sizes, including the lengths that failed on devnet.
-    /// Each size gets a full connection and a timeout that reports stalls.
+    /// An HTTP POST body arrives in full at a wide sample of sizes.
+    ///
+    /// Whether a body lost bytes depended on its exact length, so this sends
+    /// every 37th length up to 70 KB, and the lengths that failed on devnet.
+    /// Each size runs one whole connection: the handshake, the request, the
+    /// body read and the shutdown. A stall in any of them fails the test after
+    /// 5s and names the size.
     #[tokio::test]
     async fn http1_post_bodies_of_sampled_sizes_arrive_in_full() {
         fn payload(size: usize) -> Vec<u8> {
