@@ -1,0 +1,32 @@
+name: Security
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cargo-audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      # This library does not commit Cargo.lock, and cargo-audit only reads one.
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  cargo-deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
